@@ -104,7 +104,7 @@ type mutationRun struct {
 	report           *models.Report
 	mu               *sync.Mutex
 	modulePath       string
-	moduleRoot       string
+	roots            sourceRoots
 	jobs             chan<- execJob
 	stdout           io.Writer
 	stderr           io.Writer
@@ -227,7 +227,7 @@ func (e *Engine) RunResolved(ctx context.Context, opts *models.Options, bl *base
 	}
 
 	report.Calculate()
-	exitCode := finalizeResults(runEngine.Stdout, runEngine.Stderr, opts, report, bl, run.moduleRoot, run.runMutantIDFound.Load())
+	exitCode := finalizeResults(runEngine.Stdout, runEngine.Stderr, opts, report, bl, run.roots, run.runMutantIDFound.Load())
 	return Result{Report: report, ExitCode: exitCode}, nil
 }
 
@@ -338,7 +338,7 @@ func (e *Engine) initRun(ctx context.Context, opts *models.Options, targets impo
 		report:           report,
 		mu:               &reportMu,
 		modulePath:       detectModulePath(goDir),
-		moduleRoot:       detectModuleRoot(goDir),
+		roots:            resolveSourceRoots(goDir),
 		jobs:             jobs,
 		stdout:           e.Stdout,
 		stderr:           e.Stderr,
@@ -722,7 +722,7 @@ func prepareScopedMutation(r *mutationRun, m mutatorItem, fc *fileContext, mutat
 		recordCaptureFailure(r, mutant, err)
 		return preparedMutation{}, false
 	}
-	relFile := baseline.RelPath(fc.absFile, r.moduleRoot)
+	relFile := r.roots.ModulePath(fc.absFile)
 	checksum := stableMutationEditKey(relFile, originalSourceCode, edit)
 	mutant.Checksum = checksum
 	id, err := discoveredMutantID(r, fc, m, edit)
@@ -733,7 +733,7 @@ func prepareScopedMutation(r *mutationRun, m mutatorItem, fc *fileContext, mutat
 	mutant.ID = id
 	return preparedMutation{
 		candidate: scopeCandidate{
-			relFile:  relFile,
+			repoFile: r.roots.RepoPath(fc.absFile),
 			absFile:  fc.absFile,
 			line:     int(originalStartLine),
 			checksum: checksum,
@@ -764,7 +764,7 @@ func prepareMutantIdentities(r *mutationRun, fc *fileContext, m mutatorItem) {
 	if fc.identities == nil {
 		fc.identities = make(map[string]map[string]string)
 	}
-	relFile := baseline.RelPath(fc.absFile, r.moduleRoot)
+	relFile := r.roots.ModulePath(fc.absFile)
 	fc.identities[m.Name] = mutantIdentities(fc.pkg, fc.info, fc.fset, fc.src, fc.originalSource, relFile, m.Name, m.Mutator)
 }
 
@@ -795,9 +795,9 @@ func recordCaptureFailure(r *mutationRun, mutant models.Mutant, err error) {
 func noteRejectedMutation(r *mutationRun, c scopeCandidate, reason skipReason) {
 	switch reason {
 	case skipGitDiff:
-		console.Debug(r.opts, "Skip %s:%d (not in git diff)", c.relFile, c.line)
+		console.Debug(r.opts, "Skip %s:%d (not in git diff)", c.repoFile, c.line)
 	case skipMutantID:
-		console.Debug(r.opts, "Skip %s:%d (mutant id not selected)", c.relFile, c.line)
+		console.Debug(r.opts, "Skip %s:%d (mutant id not selected)", c.repoFile, c.line)
 	case skipDuplicate, skipBlacklist:
 		if r.opts.General.DryRun {
 			return
@@ -828,13 +828,13 @@ func queueMutation(r *mutationRun, fc *fileContext, mutation mutago.PositionedMu
 			mutationFile: fmt.Sprintf("%s.%d", fc.mutatedFile, mutationID),
 			absFile:      fc.absFile,
 			relFile:      prepared.relFile,
-			moduleRoot:   r.moduleRoot,
+			moduleRoot:   r.roots.module,
 			original:     originalSourceCode,
 			edit:         prepared.edit,
 		},
 		packageLevelDecl: isPackageLevelDecl(fc.src, mutation.Position),
 		directiveShifted: adjPos.Filename != rawPos.Filename || adjPos.Line != rawPos.Line,
-		adjRelFile:       baseline.RelPath(filepath.Join(r.moduleRoot, adjPos.Filename), r.moduleRoot),
+		adjRelFile:       r.roots.ModulePath(filepath.Join(r.roots.module, adjPos.Filename)),
 	}
 	select {
 	case <-r.ctx.Done():
@@ -1241,19 +1241,19 @@ func shutdownAndCleanup(stderr io.Writer, opts *models.Options, jobs chan execJo
 	console.Debug(opts, "Remove %q", tmpDir)
 }
 
-func finalizeResults(stdout, stderr io.Writer, opts *models.Options, report *models.Report, bl *baseline.File, moduleRoot string, runMutantIDFound bool) int {
+func finalizeResults(stdout, stderr io.Writer, opts *models.Options, report *models.Report, bl *baseline.File, roots sourceRoots, runMutantIDFound bool) int {
 	if opts.Exec.RunMutantID != "" && !runMutantIDFound {
 		fmt.Fprintf(stderr, "No mutant with ID %q was found\n", opts.Exec.RunMutantID)
 		return returnError
 	}
 
-	if handled, code := handleBaselineUpdate(stdout, stderr, opts, report, moduleRoot); handled {
+	if handled, code := handleBaselineUpdate(stdout, stderr, opts, report, roots.module); handled {
 		return code
 	}
 
-	printResultsIfNeeded(stdout, opts, report)
+	printResultsIfNeeded(stdout, opts, report, roots)
 
-	if code := writeAllReports(stderr, opts, report, moduleRoot); code != returnOk {
+	if code := writeAllReports(stderr, opts, report, roots); code != returnOk {
 		return code
 	}
 
@@ -1275,7 +1275,7 @@ func handleBaselineUpdate(stdout, stderr io.Writer, opts *models.Options, report
 	return true, returnOk
 }
 
-func printResultsIfNeeded(stdout io.Writer, opts *models.Options, report *models.Report) {
+func printResultsIfNeeded(stdout io.Writer, opts *models.Options, report *models.Report, roots sourceRoots) {
 	if opts.Exec.NoExec {
 		fmt.Fprintln(stdout, "Cannot do a mutation testing summary since no exec command was executed.")
 		return
@@ -1284,11 +1284,11 @@ func printResultsIfNeeded(stdout io.Writer, opts *models.Options, report *models
 		printSummary(stdout, report)
 	}
 	if opts.Logger.GitHub {
-		printGitHubAnnotations(stdout, report)
+		printGitHubAnnotations(stdout, report, roots)
 	}
 }
 
-func writeAllReports(stderr io.Writer, opts *models.Options, report *models.Report, moduleRoot string) int {
+func writeAllReports(stderr io.Writer, opts *models.Options, report *models.Report, roots sourceRoots) int {
 	specs := []reportSpec{
 		{
 			enabled:  opts.Config.JSONOutput,
@@ -1302,12 +1302,12 @@ func writeAllReports(stderr io.Writer, opts *models.Options, report *models.Repo
 		},
 		{
 			enabled:  opts.Logger.AgenticJSON,
-			write:    func() error { return reportmaker.MakeAgenticJSONReport(*report, moduleRoot) },
+			write:    func() error { return reportmaker.MakeAgenticJSONReport(*report, roots.module) },
 			savedMsg: "Save agentic report into %q", fileName: models.ReportAgenticJSONFileName,
 		},
 		{
 			enabled:  opts.Logger.GitLab,
-			write:    func() error { return reportmaker.MakeGitLabReport(*report, moduleRoot) },
+			write:    func() error { return reportmaker.MakeGitLabReport(*report, roots.RepoPath) },
 			savedMsg: "Save GitLab report into %q", fileName: models.ReportGitLabJSONFileName,
 		},
 		{
@@ -1375,19 +1375,10 @@ func printSummary(stdout io.Writer, report *models.Report) {
 	}
 }
 
-func printGitHubAnnotations(stdout io.Writer, report *models.Report) {
-	repoRoot := ""
-	if out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output(); err == nil {
-		repoRoot = strings.TrimSpace(string(out))
-	}
-
+func printGitHubAnnotations(stdout io.Writer, report *models.Report, roots sourceRoots) {
 	for _, m := range report.Escaped {
-		// GitHub resolves annotation paths against the repository root, which
-		// differs from the module root when the module lives in a subdirectory.
-		filePath := filepath.ToSlash(m.Mutator.OriginalFilePath)
-		if repoRoot != "" {
-			filePath = baseline.RelPath(m.Mutator.OriginalFilePath, repoRoot)
-		}
+		// GitHub resolves annotation paths against the repository root.
+		filePath := roots.RepoPath(m.Mutator.OriginalFilePath)
 		fmt.Fprintf(stdout, "::warning file=%s,line=%d,title=Mutant escaped (%s)::Escaped mutation at %s:%d — add a test to kill it\n",
 			filePath,
 			m.Mutator.OriginalStartLine,

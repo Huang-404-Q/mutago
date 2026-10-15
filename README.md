@@ -411,7 +411,7 @@ jobs:
 
 `--logger-github` emits escaped mutants as `::warning` annotations that appear inline on the PR diff. `--coverage` excludes untested code from the covered-MSI denominator so you aren't penalised for dead code your tests never reach.
 
-For GitLab, replace `--logger-github` with `--logger-gitlab`. This writes `mutago-gitlab.json` in GitLab Code Quality format, which GitLab CI picks up as a code quality report on merge requests.
+For GitLab, replace `--logger-github` with `--logger-gitlab`. This writes `mutago-gitlab.json` in GitLab Code Quality format, which GitLab CI picks up as a code quality report on merge requests. Both loggers write paths relative to the repository root, so they also work when `go.mod` lives in a subdirectory.
 
 **Adopting gates on a legacy codebase**: record the current survivors first, then only fail on new regressions.
 
