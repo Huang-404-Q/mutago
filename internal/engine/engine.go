@@ -148,6 +148,13 @@ type execJob struct {
 	// root (the filename Go's coverage profile uses for this position). It is
 	// only meaningful when directiveShifted is true.
 	adjRelFile string
+	// Go does not emit individual coverage ranges for case/communication
+	// clauses. For mutations inside one, these fields point at the enclosing
+	// switch/select header, whose coverage proves that the condition ran.
+	coverageAnchorFile     string
+	coverageAnchorRelFile string
+	coverageAnchorRawLine int
+	coverageAnchorLine    int
 }
 
 type mutationSource struct {
@@ -783,6 +790,13 @@ func noteRejectedMutation(r *mutationRun, c scopeCandidate, reason skipReason) {
 func queueMutation(r *mutationRun, jobs chan<- execJob, fc *fileContext, mutation mutago.PositionedMutation, mutationID int, originalSourceCode []byte, prepared preparedMutation) {
 	adjPos := fc.fset.PositionFor(mutation.Position, true)
 	rawPos := fc.fset.PositionFor(mutation.Position, false)
+	anchorPos := coverageAnchorForMutation(fc.src, mutation.Position)
+	anchorAdj := fc.fset.PositionFor(anchorPos, true)
+	anchorRaw := fc.fset.PositionFor(anchorPos, false)
+	anchorRelFile := ""
+	if anchorPos.IsValid() {
+		anchorRelFile = r.roots.ModulePath(filepath.Join(r.roots.module, anchorAdj.Filename))
+	}
 	job := execJob{
 		ctx:            r.ctx,
 		opts:           r.opts,
@@ -807,6 +821,10 @@ func queueMutation(r *mutationRun, jobs chan<- execJob, fc *fileContext, mutatio
 		packageLevelDecl: isPackageLevelDecl(fc.src, mutation.Position),
 		directiveShifted: adjPos.Filename != rawPos.Filename || adjPos.Line != rawPos.Line,
 		adjRelFile:       r.roots.ModulePath(filepath.Join(r.roots.module, adjPos.Filename)),
+		coverageAnchorFile:     fc.absFile,
+		coverageAnchorRelFile: anchorRelFile,
+		coverageAnchorRawLine: anchorRaw.Line,
+		coverageAnchorLine:    anchorAdj.Line,
 	}
 	select {
 	case <-r.ctx.Done():
@@ -1529,6 +1547,57 @@ func stableMutationKey(original, mutated []byte) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// coverageAnchorForMutation returns the enclosing switch/type-switch/select
+// header for a mutation inside a case or communication clause. Go coverage
+// profiles record execution for the header, but not a separate range for each
+// clause expression.
+func coverageAnchorForMutation(root ast.Node, position token.Pos) token.Pos {
+	if root == nil || !position.IsValid() {
+		return token.NoPos
+	}
+
+	var ancestors []ast.Node
+	var anchor token.Pos
+	ast.Inspect(root, func(node ast.Node) bool {
+		if node == nil {
+			ancestors = ancestors[:len(ancestors)-1]
+			return true
+		}
+
+		var clause bool
+		switch n := node.(type) {
+		case *ast.CaseClause:
+			for _, expr := range n.List {
+				if position >= expr.Pos() && position <= expr.End() {
+					clause = true
+					break
+				}
+			}
+		case *ast.CommClause:
+			clause = n.Comm != nil && position >= n.Comm.Pos() && position <= n.Comm.End()
+		}
+		if clause {
+			for i := len(ancestors) - 1; i >= 0; i-- {
+				switch n := ancestors[i].(type) {
+				case *ast.SwitchStmt:
+					anchor = n.Pos()
+					return false
+				case *ast.TypeSwitchStmt:
+					anchor = n.Pos()
+					return false
+				case *ast.SelectStmt:
+					anchor = n.Pos()
+					return false
+				}
+			}
+		}
+
+		ancestors = append(ancestors, node)
+		return true
+	})
+	return anchor
+}
+
 // mutationCovered reports whether the mutation at startLine is reached by any
 // test, accounting for //line directives. The primary lookup uses the physical
 // file path (the common case, where the adjusted line equals the raw line). For
@@ -1540,6 +1609,12 @@ func stableMutationKey(original, mutated []byte) string {
 // so it never applies to ordinary positions (see #84).
 func mutationCovered(job execJob, startLine int) bool {
 	if job.coverProfile.IsCovered(job.source.absFile, startLine) {
+		return true
+	}
+	if job.coverageAnchorRawLine > 0 && job.coverProfile.IsCovered(job.coverageAnchorFile, job.coverageAnchorRawLine) {
+		return true
+	}
+	if job.coverageAnchorLine > 0 && job.coverProfile.IsCoveredRelative(job.coverageAnchorRelFile, job.coverageAnchorLine) {
 		return true
 	}
 	if !job.directiveShifted || job.adjRelFile == "" {

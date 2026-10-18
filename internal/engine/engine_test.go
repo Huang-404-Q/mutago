@@ -698,6 +698,119 @@ func TestDouble(t *testing.T) {
 	}
 }
 
+// TestEngineCoverageRunsCaseExpressionMutations is a regression test for #297:
+// Go's coverage profile records that a switch ran, but does not emit a range
+// for each case expression. Mutations in conditions that are evaluated false
+// were therefore marked NOT COVERED even though changing them can select a
+// different case and is observable by the test suite.
+func TestEngineCoverageRunsCaseExpressionMutations(t *testing.T) {
+	_ = os.MkdirAll("./testdata", 0755)
+	tempDir, err := os.MkdirTemp("./testdata", "caseexprcov-*")
+	if err != nil {
+		t.Fatalf("failed to create temp package: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	src := `package caseexprcov
+
+func Label(code int) string {
+	switch {
+	case code >= 600:
+		return "invalid"
+	case code >= 500:
+		return "server"
+	}
+	return "ok"
+}
+`
+	testSrc := `package caseexprcov
+
+import "testing"
+
+func TestLabel(t *testing.T) {
+	for code, want := range map[int]string{500: "server", 599: "server", 499: "ok"} {
+		if got := Label(code); got != want {
+			t.Fatalf("Label(%d) = %q, want %q", code, got, want)
+		}
+	}
+}
+`
+	if err := os.WriteFile(filepath.Join(tempDir, "pkg.go"), []byte(src), 0644); err != nil {
+		t.Fatalf("failed to write pkg.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "pkg_test.go"), []byte(testSrc), 0644); err != nil {
+		t.Fatalf("failed to write pkg_test.go: %v", err)
+	}
+
+	opts := &models.Options{}
+	opts.Exec.Coverage = true
+	opts.Exec.Timeout = 10
+	opts.Mutator.DisableMutators = []string{
+		"arithmetic/*", "branch/*", "composite/*", "concurrency/*",
+		"expression/*", "loop/*", "numbers/*", "select/*", "statement/*",
+	}
+	opts.Remaining.Targets = []string{"./" + tempDir}
+
+	var stdout, stderr bytes.Buffer
+	e := &Engine{Stdout: &stdout, Stderr: &stderr}
+	res, err := e.Run(context.Background(), opts, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Report == nil {
+		t.Fatal("expected report to be populated, got nil")
+	}
+	if res.Report.Stats.TotalMutantsCount == 0 {
+		t.Fatalf("expected conditional mutants in case expressions; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	caseLines := map[int64]bool{5: true, 7: true}
+	for _, mutant := range res.Report.NotCovered {
+		if caseLines[mutant.Mutator.OriginalStartLine] {
+			t.Fatalf("case expression mutation on line %d was marked NOT COVERED; stdout=%q stderr=%q",
+				mutant.Mutator.OriginalStartLine, stdout.String(), stderr.String())
+		}
+	}
+}
+
+func TestCoverageAnchorForMutationOnlyMatchesClauseExpressions(t *testing.T) {
+	src := `package sample
+
+func Label(code int) string {
+	switch {
+	case code >= 600:
+		return "invalid"
+	}
+	return "ok"
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "sample.go", src, 0)
+	if err != nil {
+		t.Fatalf("failed to parse fixture: %v", err)
+	}
+
+	var condition token.Pos
+	var body token.Pos
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.BinaryExpr:
+			condition = n.OpPos
+		case *ast.ReturnStmt:
+			body = n.Pos()
+		}
+		return true
+	})
+
+	anchor := coverageAnchorForMutation(file, condition)
+	if got := fset.Position(anchor).Line; got != 4 {
+		t.Fatalf("case condition should anchor to switch line 4, got line %d", got)
+	}
+	if bodyAnchor := coverageAnchorForMutation(file, body); bodyAnchor.IsValid() {
+		t.Fatalf("case body mutation must not use the switch header as a coverage anchor: %v", fset.Position(bodyAnchor))
+	}
+}
+
 // TestEngineCoverageHonorsLineDirectives is a regression test for #84: a
 // //line directive shifts Go's coverage-profile line attribution to the
 // directive's line (and, for a named directive, its filename), while mutago
