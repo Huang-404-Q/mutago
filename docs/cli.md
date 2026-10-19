@@ -56,6 +56,14 @@ Targets can be Go source files, directories, or import paths. The `...` wildcard
 | `--per-test` | Build a per-test coverage map and run only the tests that cover each mutation. Best for packages with slow tests. Pairs well with `--coverage`. With `--test-recursive`, the map also covers subpackage tests. If any test's coverage profile is missing or unreadable, mutago runs the full suite instead. |
 | `--test-flags` | Extra flags passed to every `go test` call (e.g. `--test-flags=-short`). Use the `=` form for values starting with a dash. Adaptive timeout preserves a positive `-count=N`, adds `-count=1` when absent, and rejects `-count=0`. Ignored when `--exec` is set. |
 
+### Clause-Header Coverage Anchoring
+
+Go's coverage profile records execution for `switch`, type-switch, and `select` header statements, but does not emit individual coverage ranges for clause expressions (`case ...:`, `default:`, `case <-ch:`). Under `--coverage`, mutations inside case conditions and communication clauses are anchored to their enclosing statement's header line, so they are executed and scored whenever the enclosing statement is reached by tests.
+
+Mutations inside clause bodies continue to use their own line coverage, so a never-selected clause body remains `NOT COVERED`.
+
+**Limitation:** A hit on the switch or select header proves that the statement was entered, but cannot prove whether an earlier clause already matched and short-circuited evaluation of subsequent clauses. If an earlier clause always matches, mutants in subsequent clause expressions will run and report as `ESCAPED` (a visible test gap) rather than `NOT COVERED`.
+
 ## Vet
 
 Every built-in `go test` run (baseline pre-flight, coverage, and mutant runs) passes `-vet=off` by default. A mutant is not meant to be lint-clean, and a `go vet` diagnostic on mutated code would fail the run and be miscounted as KILLED. The baseline and coverage runs use the same setting so they judge tests the same way the mutant runs do. Pass your own `-vet` via `--test-flags` to re-enable it (e.g. `--test-flags=-vet=all`); your flag wins in every run and no duplicate is added.

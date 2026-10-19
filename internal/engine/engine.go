@@ -151,7 +151,7 @@ type execJob struct {
 	// Go does not emit individual coverage ranges for case/communication
 	// clauses. For mutations inside one, these fields point at the enclosing
 	// switch/select header, whose coverage proves that the condition ran.
-	coverageAnchorFile     string
+	coverageAnchorFile    string
 	coverageAnchorRelFile string
 	coverageAnchorRawLine int
 	coverageAnchorLine    int
@@ -165,6 +165,11 @@ type mutationSource struct {
 	moduleRoot   string
 	original     []byte
 	edit         mutationEdit
+}
+
+type caseHead struct {
+	from, colon token.Pos
+	stmtPos     token.Pos
 }
 
 type fileContext struct {
@@ -183,6 +188,7 @@ type fileContext struct {
 	// identities maps mutator name to the stable IDs of its edits in this
 	// file, keyed by mutationEdit.key. See mutantIdentities.
 	identities map[string]map[string]string
+	caseHeads  []caseHead
 }
 
 // Run executes the mutation testing lifecycle based on options and baseline.
@@ -606,6 +612,7 @@ func processFile(r *mutationRun, file string, testPkg string, coverProfile *cove
 		perTestProf:    perTestProf,
 		filters:        nodeFilters,
 		originalSource: originalSource,
+		caseHeads:      caseHeads(src),
 	}
 
 	return mutateFile(r, fc)
@@ -790,7 +797,7 @@ func noteRejectedMutation(r *mutationRun, c scopeCandidate, reason skipReason) {
 func queueMutation(r *mutationRun, jobs chan<- execJob, fc *fileContext, mutation mutago.PositionedMutation, mutationID int, originalSourceCode []byte, prepared preparedMutation) {
 	adjPos := fc.fset.PositionFor(mutation.Position, true)
 	rawPos := fc.fset.PositionFor(mutation.Position, false)
-	anchorPos := coverageAnchorForMutation(fc.src, mutation.Position)
+	anchorPos := caseHeaderAnchor(fc.caseHeads, mutation.Position)
 	anchorAdj := fc.fset.PositionFor(anchorPos, true)
 	anchorRaw := fc.fset.PositionFor(anchorPos, false)
 	anchorRelFile := ""
@@ -818,10 +825,10 @@ func queueMutation(r *mutationRun, jobs chan<- execJob, fc *fileContext, mutatio
 			original:     originalSourceCode,
 			edit:         prepared.edit,
 		},
-		packageLevelDecl: isPackageLevelDecl(fc.src, mutation.Position),
-		directiveShifted: adjPos.Filename != rawPos.Filename || adjPos.Line != rawPos.Line,
-		adjRelFile:       r.roots.ModulePath(filepath.Join(r.roots.module, adjPos.Filename)),
-		coverageAnchorFile:     fc.absFile,
+		packageLevelDecl:      isPackageLevelDecl(fc.src, mutation.Position),
+		directiveShifted:      adjPos.Filename != rawPos.Filename || adjPos.Line != rawPos.Line,
+		adjRelFile:            r.roots.ModulePath(filepath.Join(r.roots.module, adjPos.Filename)),
+		coverageAnchorFile:    fc.absFile,
 		coverageAnchorRelFile: anchorRelFile,
 		coverageAnchorRawLine: anchorRaw.Line,
 		coverageAnchorLine:    anchorAdj.Line,
@@ -1547,55 +1554,56 @@ func stableMutationKey(original, mutated []byte) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// caseHeads lists every clause head of file's switch, type switch and select
+// statements, read before any mutation.
+func caseHeads(file ast.Node) []caseHead {
+	var heads []caseHead
+	ast.Inspect(file, func(n ast.Node) bool {
+		var body *ast.BlockStmt
+		switch s := n.(type) {
+		case *ast.SwitchStmt:
+			body = s.Body
+		case *ast.TypeSwitchStmt:
+			body = s.Body
+		case *ast.SelectStmt:
+			body = s.Body
+		}
+		if body == nil {
+			return true
+		}
+		stmtPos := n.Pos()
+		for _, c := range body.List {
+			switch cc := c.(type) {
+			case *ast.CaseClause:
+				heads = append(heads, caseHead{from: cc.Case, colon: cc.Colon, stmtPos: stmtPos})
+			case *ast.CommClause:
+				heads = append(heads, caseHead{from: cc.Case, colon: cc.Colon, stmtPos: stmtPos})
+			}
+		}
+		return true
+	})
+	return heads
+}
+
+// caseHeaderAnchor returns the statement position of the innermost clause head that
+// holds pos - its keyword, its expressions or its communication - and token.NoPos when
+// pos is in no head. A clause's body has a coverage block of its own.
+func caseHeaderAnchor(heads []caseHead, pos token.Pos) token.Pos {
+	anchor, width := token.NoPos, token.Pos(-1)
+	for _, h := range heads {
+		if pos >= h.from && pos <= h.colon && (width < 0 || h.colon-h.from < width) {
+			anchor, width = h.stmtPos, h.colon-h.from
+		}
+	}
+	return anchor
+}
+
 // coverageAnchorForMutation returns the enclosing switch/type-switch/select
 // header for a mutation inside a case or communication clause. Go coverage
 // profiles record execution for the header, but not a separate range for each
 // clause expression.
 func coverageAnchorForMutation(root ast.Node, position token.Pos) token.Pos {
-	if root == nil || !position.IsValid() {
-		return token.NoPos
-	}
-
-	var ancestors []ast.Node
-	var anchor token.Pos
-	ast.Inspect(root, func(node ast.Node) bool {
-		if node == nil {
-			ancestors = ancestors[:len(ancestors)-1]
-			return true
-		}
-
-		var clause bool
-		switch n := node.(type) {
-		case *ast.CaseClause:
-			for _, expr := range n.List {
-				if position >= expr.Pos() && position <= expr.End() {
-					clause = true
-					break
-				}
-			}
-		case *ast.CommClause:
-			clause = n.Comm != nil && position >= n.Comm.Pos() && position <= n.Comm.End()
-		}
-		if clause {
-			for i := len(ancestors) - 1; i >= 0; i-- {
-				switch n := ancestors[i].(type) {
-				case *ast.SwitchStmt:
-					anchor = n.Pos()
-					return false
-				case *ast.TypeSwitchStmt:
-					anchor = n.Pos()
-					return false
-				case *ast.SelectStmt:
-					anchor = n.Pos()
-					return false
-				}
-			}
-		}
-
-		ancestors = append(ancestors, node)
-		return true
-	})
-	return anchor
+	return caseHeaderAnchor(caseHeads(root), position)
 }
 
 // mutationCovered reports whether the mutation at startLine is reached by any

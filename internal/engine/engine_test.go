@@ -742,46 +742,124 @@ func TestLabel(t *testing.T) {
 		t.Fatalf("failed to write pkg_test.go: %v", err)
 	}
 
-	opts := &models.Options{}
-	opts.Exec.Coverage = true
-	opts.Exec.Timeout = 10
-	opts.Mutator.DisableMutators = []string{
-		"arithmetic/*", "branch/*", "composite/*", "concurrency/*",
-		"expression/*", "loop/*", "numbers/*", "select/*", "statement/*",
-	}
-	opts.Remaining.Targets = []string{"./" + tempDir}
+	optsNoCov := &models.Options{}
+	optsNoCov.Exec.Timeout = 10
+	optsNoCov.Remaining.Targets = []string{"./" + tempDir}
 
-	var stdout, stderr bytes.Buffer
-	e := &Engine{Stdout: &stdout, Stderr: &stderr}
-	res, err := e.Run(context.Background(), opts, nil)
+	var stdoutNoCov, stderrNoCov bytes.Buffer
+	eNoCov := &Engine{Stdout: &stdoutNoCov, Stderr: &stderrNoCov}
+	resNoCov, err := eNoCov.Run(context.Background(), optsNoCov, nil)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("unexpected error without coverage: %v", err)
 	}
-	if res.Report == nil {
-		t.Fatal("expected report to be populated, got nil")
+	if resNoCov.Report == nil {
+		t.Fatal("expected report without coverage, got nil")
 	}
-	if res.Report.Stats.TotalMutantsCount == 0 {
-		t.Fatalf("expected conditional mutants in case expressions; stdout=%q stderr=%q", stdout.String(), stderr.String())
+
+	optsCov := &models.Options{}
+	optsCov.Exec.Coverage = true
+	optsCov.Exec.Timeout = 10
+	optsCov.Remaining.Targets = []string{"./" + tempDir}
+
+	var stdoutCov, stderrCov bytes.Buffer
+	eCov := &Engine{Stdout: &stdoutCov, Stderr: &stderrCov}
+	resCov, err := eCov.Run(context.Background(), optsCov, nil)
+	if err != nil {
+		t.Fatalf("unexpected error with coverage: %v", err)
 	}
+	if resCov.Report == nil {
+		t.Fatal("expected report with coverage, got nil")
+	}
+
+	statusMap := func(rep *models.Report) map[string]string {
+		m := make(map[string]string)
+		for _, mutant := range rep.Killed {
+			m[mutant.ID] = "KILLED"
+		}
+		for _, mutant := range rep.Escaped {
+			m[mutant.ID] = "ESCAPED"
+		}
+		for _, mutant := range rep.NotCovered {
+			m[mutant.ID] = "NOT COVERED"
+		}
+		for _, mutant := range rep.Skipped {
+			m[mutant.ID] = "SKIPPED"
+		}
+		for _, mutant := range rep.Errored {
+			m[mutant.ID] = "ERRORED"
+		}
+		return m
+	}
+	statusesNoCov := statusMap(resNoCov.Report)
 
 	caseLines := map[int64]bool{5: true, 7: true}
-	for _, mutant := range res.Report.NotCovered {
+	for _, mutant := range resCov.Report.NotCovered {
 		if caseLines[mutant.Mutator.OriginalStartLine] {
 			t.Fatalf("case expression mutation on line %d was marked NOT COVERED; stdout=%q stderr=%q",
-				mutant.Mutator.OriginalStartLine, stdout.String(), stderr.String())
+				mutant.Mutator.OriginalStartLine, stdoutCov.String(), stderrCov.String())
 		}
+	}
+
+	checked := 0
+	for _, mutant := range resCov.Report.Killed {
+		line := mutant.Mutator.OriginalStartLine
+		if caseLines[line] {
+			if want := statusesNoCov[mutant.ID]; want != "KILLED" {
+				t.Fatalf("mutant %s on line %d has status KILLED with coverage, but %s without coverage", mutant.ID, line, want)
+			}
+			checked++
+		}
+	}
+	for _, mutant := range resCov.Report.Escaped {
+		line := mutant.Mutator.OriginalStartLine
+		if caseLines[line] {
+			if want := statusesNoCov[mutant.ID]; want != "ESCAPED" {
+				t.Fatalf("mutant %s on line %d has status ESCAPED with coverage, but %s without coverage", mutant.ID, line, want)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("expected tested case expression mutants on line 5 and 7, got none; stdout=%q", stdoutCov.String())
+	}
+
+	line6NotCovered := 0
+	for _, mutant := range resCov.Report.NotCovered {
+		if mutant.Mutator.OriginalStartLine == 6 {
+			line6NotCovered++
+		}
+	}
+	if line6NotCovered == 0 {
+		t.Fatalf("expected never-selected clause body on line 6 to remain NOT COVERED, got 0 not-covered mutants; stdout=%q", stdoutCov.String())
 	}
 }
 
 func TestCoverageAnchorForMutationOnlyMatchesClauseExpressions(t *testing.T) {
 	src := `package sample
 
-func Label(code int) string {
+func Probe(code int, v any, ch chan int) string {
 	switch {
 	case code >= 600:
 		return "invalid"
+	default:
+		return "ok"
 	}
-	return "ok"
+
+	switch x := v.(type) {
+	case int:
+		return "int"
+	default:
+		_ = x
+		return "other"
+	}
+
+	select {
+	case n := <-ch:
+		_ = n
+		return "recv"
+	default:
+		return "none"
+	}
 }
 `
 	fset := token.NewFileSet()
@@ -790,24 +868,121 @@ func Label(code int) string {
 		t.Fatalf("failed to parse fixture: %v", err)
 	}
 
-	var condition token.Pos
-	var body token.Pos
+	heads := caseHeads(file)
+	if len(heads) != 6 {
+		t.Fatalf("expected 6 clause heads (2 switch, 2 type switch, 2 select), got %d", len(heads))
+	}
+
+	var (
+		switchLine     = 4
+		typeSwitchLine = 11
+		selectLine     = 19
+
+		exprCond   token.Pos
+		exprCaseKw token.Pos
+		exprDefKw  token.Pos
+		exprBody   token.Pos
+
+		typeCond   token.Pos
+		typeCaseKw token.Pos
+		typeDefKw  token.Pos
+		typeBody   token.Pos
+
+		selComm   token.Pos
+		selCaseKw token.Pos
+		selDefKw  token.Pos
+		selBody   token.Pos
+	)
+
 	ast.Inspect(file, func(node ast.Node) bool {
 		switch n := node.(type) {
-		case *ast.BinaryExpr:
-			condition = n.OpPos
-		case *ast.ReturnStmt:
-			body = n.Pos()
+		case *ast.SwitchStmt:
+			for _, c := range n.Body.List {
+				cc := c.(*ast.CaseClause)
+				if len(cc.List) > 0 {
+					exprCaseKw = cc.Case
+					exprCond = cc.List[0].Pos()
+					exprBody = cc.Body[0].Pos()
+				} else {
+					exprDefKw = cc.Case
+				}
+			}
+		case *ast.TypeSwitchStmt:
+			for _, c := range n.Body.List {
+				cc := c.(*ast.CaseClause)
+				if len(cc.List) > 0 {
+					typeCaseKw = cc.Case
+					typeCond = cc.List[0].Pos()
+					typeBody = cc.Body[0].Pos()
+				} else {
+					typeDefKw = cc.Case
+				}
+			}
+		case *ast.SelectStmt:
+			for _, c := range n.Body.List {
+				cc := c.(*ast.CommClause)
+				if cc.Comm != nil {
+					selCaseKw = cc.Case
+					selComm = cc.Comm.Pos()
+					selBody = cc.Body[0].Pos()
+				} else {
+					selDefKw = cc.Case
+				}
+			}
 		}
 		return true
 	})
 
-	anchor := coverageAnchorForMutation(file, condition)
-	if got := fset.Position(anchor).Line; got != 4 {
-		t.Fatalf("case condition should anchor to switch line 4, got line %d", got)
+	checkAnchor := func(name string, pos token.Pos, wantLine int) {
+		anchor := coverageAnchorForMutation(file, pos)
+		if wantLine == 0 {
+			if anchor.IsValid() {
+				t.Fatalf("%s: expected no anchor, got line %d", name, fset.Position(anchor).Line)
+			}
+			return
+		}
+		if !anchor.IsValid() {
+			t.Fatalf("%s: expected anchor on line %d, got none", name, wantLine)
+		}
+		if got := fset.Position(anchor).Line; got != wantLine {
+			t.Fatalf("%s: expected anchor on line %d, got line %d", name, wantLine, got)
+		}
 	}
-	if bodyAnchor := coverageAnchorForMutation(file, body); bodyAnchor.IsValid() {
-		t.Fatalf("case body mutation must not use the switch header as a coverage anchor: %v", fset.Position(bodyAnchor))
+
+	// 1. Expression switch
+	checkAnchor("expr switch case condition", exprCond, switchLine)
+	checkAnchor("expr switch case keyword", exprCaseKw, switchLine)
+	checkAnchor("expr switch default keyword", exprDefKw, switchLine)
+	checkAnchor("expr switch body", exprBody, 0)
+
+	// 2. Type switch
+	checkAnchor("type switch case type", typeCond, typeSwitchLine)
+	checkAnchor("type switch case keyword", typeCaseKw, typeSwitchLine)
+	checkAnchor("type switch default keyword", typeDefKw, typeSwitchLine)
+	checkAnchor("type switch body", typeBody, 0)
+
+	// 3. Select comm clause
+	checkAnchor("select comm", selComm, selectLine)
+	checkAnchor("select case keyword", selCaseKw, selectLine)
+	checkAnchor("select default keyword", selDefKw, selectLine)
+	checkAnchor("select body", selBody, 0)
+
+	// 4. Outside function pos
+	checkAnchor("outside function", file.Pos(), 0)
+
+	// 5. AST mutation resilience: mutate the AST in-place (simulate clause removal)
+	// and verify pre-scanned heads still correctly anchor the positions.
+	ast.Inspect(file, func(node ast.Node) bool {
+		if s, ok := node.(*ast.SelectStmt); ok {
+			s.Body.List = nil
+		}
+		return true
+	})
+	if anchor := caseHeaderAnchor(heads, selCaseKw); fset.Position(anchor).Line != selectLine {
+		t.Fatalf("caseHeaderAnchor failed after AST mutation: want line %d, got %d", selectLine, fset.Position(anchor).Line)
+	}
+	if anchor := caseHeaderAnchor(heads, selDefKw); fset.Position(anchor).Line != selectLine {
+		t.Fatalf("caseHeaderAnchor failed after AST mutation: want line %d, got %d", selectLine, fset.Position(anchor).Line)
 	}
 }
 
